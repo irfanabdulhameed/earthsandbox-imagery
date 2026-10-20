@@ -34,7 +34,13 @@ npx tsx tools/imagery/t0.ts                                                     
 ```
 world/t0/index.json, world/t0/f<face>/t0-f<face>-x<x>-y<y>.bin     T0, one archive per level-2 cell
 world/t1/manifest.json, world/t1/shards/f<face>/f<face>-x<x>-y<y>.bin   T1, one archive per level-6 cell
+world/t1/match-8k.webp                                              T1's world-wide colour match
 ```
+
+`match-8k.webp` (8192 × 4096, lossless; per channel a linear multiplier 2^((v − 128) / 32), 128 for none) holds every T1
+shard's colour match to the Blue Marble colour, carried a little past the edge of the Sentinel-2 cover and faded out
+over 150 km. A reader applies its inverse to T0 close up, so T0 takes T1's colour where the two meet. The publish job
+writes it, with `manifest.json`, from every shard on the site.
 
 Each archive is a small binary index followed by 512 × 512 WebP tiles (an 8-pixel gutter; alpha is the signed distance to
 the shore). Cloudflare Pages answers HTTP Range requests with the whole file, so a reader fetches an archive whole (they

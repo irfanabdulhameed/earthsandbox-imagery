@@ -24,6 +24,7 @@ import sharp from 'sharp';
 import { FLAG_ALPHA, FLAG_WATER, readArchiveHead, tileKey, VERSION, writeArchive } from './archive.ts';
 import { GUTTER_PX, INNER_PX, TILE_PX } from './cube.ts';
 import { encodeTile, SHORE_ALPHA, SHORE_MIN, SHORE_STEPS, srgbToLinear, linearToSrgb } from './finish.ts';
+import { MATCH_H, MATCH_W, worldMatch, type ShardMatch } from './match-world.ts';
 import { buildShard, type ShardStats } from './shard.ts';
 import { storeFromEnv, type Store } from './store.ts';
 import { BASE_MAX_LEVEL, cellAt, cellSpec, FINE_MAX_LEVEL, loadWorldMaps, parseShardId, ROOT_LEVELS, SHARD_LEVEL, worldSpecs, type ShardSpec } from './world-cells.ts';
@@ -340,22 +341,11 @@ async function root(store: Store, argv: string[]) {
     tool: 'tools/imagery/world.ts root',
   };
   await store.put('world/root.bin', writeArchive(meta, tiles));
-  // The match field: every shard's, on color-8k's grid (128 = no change; 2^((v − 128) / 32) per channel).
-  const W = 8192;
-  const H = 4096;
-  const img = new Uint8Array(W * H * 3).fill(128);
-  for (const { head } of built) {
-    const m = head.meta.match as { col0: number; row0: number; cols: number; rows: number; data: number[] } | null;
-    if (!m) continue;
-    for (let r = 0; r < m.rows; r++)
-      for (let c = 0; c < m.cols; c++)
-        for (let b = 0; b < 3; b++) {
-          const v = m.data[(r * m.cols + c) * 3 + b];
-          if (v === 1) continue;
-          img[((m.row0 + r) * W + ((m.col0 + c) % W)) * 3 + b] = Math.max(1, Math.min(255, Math.round(128 + 32 * Math.log2(v))));
-        }
-  }
-  await store.put('world/match-8k.webp', new Uint8Array(await sharp(img, { raw: { width: W, height: H, channels: 3 } }).webp({ lossless: true, effort: 4 }).toBuffer()), 'image/webp');
+  // The match field: every shard's, on color-8k's grid (128 = no change; 2^((v − 128) / 32) per channel), run on past the
+  // cover's edge and faded out (match-world.ts).
+  const fields = built.map(({ head }) => head.meta.match as ShardMatch | null).filter((m): m is ShardMatch => !!m);
+  const img = worldMatch(fields);
+  await store.put('world/match-8k.webp', new Uint8Array(await sharp(img, { raw: { width: MATCH_W, height: MATCH_H, channels: 3 } }).webp({ lossless: true, effort: 4 }).toBuffer()), 'image/webp');
   log(`root: ${tiles.length} tiles from ${built.length} shards; match-8k.webp written`);
 }
 
@@ -363,21 +353,39 @@ async function root(store: Store, argv: string[]) {
  * The publish job's manifest: every shard archive found under <dir>/<tier prefix>/shards/, read from its own head, written
  * to <dir>/<tier prefix>/manifest.json (the list the renderer reads and the next run skips).
  */
-function siteManifest(argv: string[]) {
+async function siteManifest(argv: string[]) {
   const dir = arg(argv, 'dir');
   if (!dir) throw new Error('site-manifest: --dir <site folder> is required');
   const root = join(dir, TIER_PREFIX, 'shards');
   const shards: Record<string, unknown>[] = [];
+  const fields: ShardMatch[] = [];
+  let lo = Infinity;
+  let hi = -Infinity;
   for (const f of readdirSync(root).filter((n) => /^f\d$/.test(n)).sort())
     for (const name of readdirSync(join(root, f)).filter((n) => n.endsWith('.bin')).sort()) {
       const bytes = readFileSync(join(root, f, name));
       const head = readArchiveHead(new Uint8Array(bytes.buffer, bytes.byteOffset, Math.min(bytes.length, 1 << 20)));
       const cell = head.meta.cell as { face: number; x: number; y: number };
       shards.push({ id: name.replace(/\.bin$/, ''), face: cell.face, x: cell.x, y: cell.y, file: `shards/${f}/${name}`, bytes: bytes.length, maxLevel: head.meta.maxLevel });
+      lo = Math.min(lo, head.meta.minLevel as number);
+      hi = Math.max(hi, head.meta.maxLevel as number);
+      if (head.meta.match) fields.push(head.meta.match as ShardMatch);
     }
-  const m = { version: 3, tier: TIER_PREFIX === 'world/t1' ? 'T1' : 'full', shardLevel: SHARD_LEVEL, shards };
+  // The tier's world-wide colour match (the renderer gives its inverse to T0 close up, so T0 meets this tier's colour).
+  const img = worldMatch(fields);
+  writeFileSync(join(dir, TIER_PREFIX, 'match-8k.webp'), await sharp(img, { raw: { width: MATCH_W, height: MATCH_H, channels: 3 } }).webp({ lossless: true, effort: 4 }).toBuffer());
+  const levels = Number.isFinite(lo) ? Array.from({ length: hi - lo + 1 }, (_, k) => lo + k) : [];
+  const m = {
+    version: 3,
+    tier: TIER_PREFIX === 'world/t1' ? 'T1' : 'full',
+    shardLevel: SHARD_LEVEL,
+    cellLevel: SHARD_LEVEL,
+    levels,
+    match: { file: 'match-8k.webp', encoding: 'multiplier = 2^((v − 128) / 32) per channel, linear light; 128 = no change' },
+    shards,
+  };
   writeFileSync(join(dir, TIER_PREFIX, 'manifest.json'), JSON.stringify(m));
-  log(`site manifest: ${shards.length} shards in ${join(dir, TIER_PREFIX, 'manifest.json')}`);
+  log(`site manifest: ${shards.length} shards, levels ${levels.join(',')}, match field from ${fields.length} shards, in ${join(dir, TIER_PREFIX)}`);
 }
 
 /** Pictures of the built shards (and the root around them) for checking: reports/shots/photo-map/world-dry-run/. */
