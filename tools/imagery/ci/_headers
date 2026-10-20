@@ -1,0 +1,13 @@
+# Cloudflare Pages headers for the tile site (copied to the site's root as _headers by the workflows).
+# Any web page may read the tiles (open data); archives are fetched whole (Pages answers Range requests with the whole
+# file, docs/world-imagery-plan.md) and change rarely, so browsers may keep them a week.
+/*
+  Access-Control-Allow-Origin: *
+  Access-Control-Expose-Headers: Content-Length, ETag
+  X-Content-Type-Options: nosniff
+
+/world/t0/*.bin
+  Cache-Control: public, max-age=604800
+
+/world/t1/shards/*
+  Cache-Control: public, max-age=604800

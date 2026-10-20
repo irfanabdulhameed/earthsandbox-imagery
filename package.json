@@ -1,0 +1,23 @@
+{
+  "name": "earthsandbox-imagery",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Builds a world satellite photo map (NASA Blue Marble and Copernicus Sentinel-2) as cube-sphere tile archives and publishes them to Cloudflare Pages.",
+  "type": "module",
+  "license": "UNLICENSED",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "plan": "tsx tools/imagery/world.ts plan",
+    "t0": "tsx tools/imagery/t0.ts",
+    "t1": "tsx tools/imagery/world.ts run --tier t1 --all",
+    "site-manifest": "tsx tools/imagery/world.ts site-manifest",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "sharp": "0.34.5",
+    "tsx": "4.23.15",
+    "typescript": "~6.0.3",
+    "wrangler": "4.151.3"
+  }
+}

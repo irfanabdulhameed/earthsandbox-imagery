@@ -1,0 +1,121 @@
+# T1: the whole world's land at 80 m from Sentinel-2 overviews, 8,135 shards, built by 20 parallel jobs and published to
+# Cloudflare Pages in ONE deployment at the end (a Pages deployment must hold the whole site).
+#
+# Resumable: every job reads the live site's world/t1/manifest.json and skips shards already published, builds its own
+# share (every 20th shard) until its time budget runs out, and hands its shards to the publish job as an artifact. Run it
+# again (by hand, or let the schedule do it) until the log says nothing is left; each run publishes what it built.
+# Free: standard runners in a public repository cost nothing; Cloudflare Pages' free plan has no card on file.
+name: T1 world base (80 m)
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: Minutes each job builds before it stops taking new shards (jobs end by 6 hours)
+        default: '300'
+      limit:
+        description: At most this many shards per job (empty for no limit; 1 for a quick test)
+        default: ''
+  schedule:
+    - cron: '17 */6 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: imagery-site
+  cancel-in-progress: false
+
+env:
+  PAGES_PROJECT: ${{ vars.PAGES_PROJECT || 'earthsandbox-imagery' }}
+  PAGES_URL: https://${{ vars.PAGES_PROJECT || 'earthsandbox-imagery' }}.pages.dev
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        slice: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - name: Build this job's share of the shards
+        env:
+          IMAGERY_OUT: out
+          IMAGERY_WORK: work
+          UV_THREADPOOL_SIZE: '8'
+        run: |
+          LIMIT="${{ github.event.inputs.limit }}"
+          npx tsx tools/imagery/world.ts run --tier t1 --all --workers 4 \
+            --slice ${{ matrix.slice }}/20 \
+            --published "$PAGES_URL/world/t1/manifest.json" \
+            --deadline-minutes "${{ github.event.inputs.minutes || '300' }}" \
+            ${LIMIT:+--limit "$LIMIT"}
+          # The per-shard build records stay here; the site gets one manifest instead.
+          find out/world/t1/shards -name '*.json' -delete 2>/dev/null || true
+          mkdir -p out/world/t1/shards
+          echo "built $(find out/world/t1/shards -name '*.bin' | wc -l) shards, $(du -sh out/world/t1/shards | cut -f1)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: t1-${{ matrix.slice }}
+          path: out/world/t1/shards
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: ignore
+
+  publish:
+    needs: build
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - name: This run's new shards
+        uses: actions/download-artifact@v4
+        with:
+          pattern: t1-*
+          path: site/world/t1/shards
+          merge-multiple: true
+      - name: Count them
+        id: new
+        run: |
+          N=$(find site/world/t1/shards -name '*.bin' 2>/dev/null | wc -l)
+          echo "count=$N" >> "$GITHUB_OUTPUT"
+          echo "$N new shards"
+      - name: Is the site live yet?
+        id: live
+        if: steps.new.outputs.count != '0'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if npx wrangler pages project list 2>/dev/null | grep -qw "$PAGES_PROJECT"; then echo "live=1" >> "$GITHUB_OUTPUT"; else echo "live=0" >> "$GITHUB_OUTPUT"; fi
+      - name: Everything already published (a deployment must hold the whole site)
+        if: steps.new.outputs.count != '0' && steps.live.outputs.live == '1'
+        run: npx tsx tools/imagery/ci/mirror-live.ts site "$PAGES_URL"
+      - name: Manifest, headers and pages
+        if: steps.new.outputs.count != '0'
+        run: |
+          npx tsx tools/imagery/world.ts site-manifest --tier t1 --dir site
+          cp tools/imagery/ci/_headers site/_headers
+          cp tools/imagery/ci/site/index.html tools/imagery/ci/site/404.html site/
+          echo "site: $(find site -type f | wc -l) files, $(du -sh site | cut -f1) (Pages free: 20,000 files, 25 MiB each)"
+      - name: Deploy to Cloudflare Pages
+        if: steps.new.outputs.count != '0'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          npx wrangler pages project create "$PAGES_PROJECT" --production-branch main >/dev/null 2>&1 || true
+          npx wrangler pages deploy site --project-name "$PAGES_PROJECT" --branch main --commit-dirty=true

@@ -1,0 +1,57 @@
+# T0: NASA Blue Marble Next Generation at 500 m for the whole globe (96 archives, about 76 MB), built in one job and
+# published together with whatever T1 the site already has (one Pages deployment holds the whole site).
+name: T0 world Blue Marble (500 m)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: imagery-site
+  cancel-in-progress: false
+
+env:
+  PAGES_PROJECT: ${{ vars.PAGES_PROJECT || 'earthsandbox-imagery' }}
+  PAGES_URL: https://${{ vars.PAGES_PROJECT || 'earthsandbox-imagery' }}.pages.dev
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - name: Build T0 (the eight 500 m panels, one at a time)
+        env:
+          IMAGERY_OUT: site
+        run: npx tsx tools/imagery/t0.ts
+      - name: Is the site live yet?
+        id: live
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if npx wrangler pages project list 2>/dev/null | grep -qw "$PAGES_PROJECT"; then echo "live=1" >> "$GITHUB_OUTPUT"; else echo "live=0" >> "$GITHUB_OUTPUT"; fi
+      - name: Everything else already published
+        if: steps.live.outputs.live == '1'
+        run: npx tsx tools/imagery/ci/mirror-live.ts site "$PAGES_URL"
+      - name: Manifest, headers and pages
+        run: |
+          if [ -d site/world/t1/shards ]; then npx tsx tools/imagery/world.ts site-manifest --tier t1 --dir site; fi
+          rm -f site/world/plan.json
+          cp tools/imagery/ci/_headers site/_headers
+          cp tools/imagery/ci/site/index.html tools/imagery/ci/site/404.html site/
+          echo "site: $(find site -type f | wc -l) files, $(du -sh site | cut -f1)"
+      - name: Deploy to Cloudflare Pages
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          npx wrangler pages project create "$PAGES_PROJECT" --production-branch main >/dev/null 2>&1 || true
+          npx wrangler pages deploy site --project-name "$PAGES_PROJECT" --branch main --commit-dirty=true

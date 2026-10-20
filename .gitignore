@@ -1,0 +1,9 @@
+node_modules/
+tools/imagery/.cache/
+out/
+work/
+site/
+reports/
+*.log
+.env
+.env*
