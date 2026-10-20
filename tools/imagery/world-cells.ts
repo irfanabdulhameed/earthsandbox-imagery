@@ -177,6 +177,9 @@ export interface ShardSpec {
   snow: boolean;
   /** Dry runs only: build the 10 m blocks nearest this point first (latitude, longitude). */
   focus?: [number, number];
+  /** T2 only: the block's picked level-9 tiles, and the index of its Pages project in the T2 plan. */
+  tiles?: { x: number; y: number }[];
+  project?: number;
 }
 
 const usable = (lat: number) => lat >= SOUTH_LIMIT && lat <= NORTH_LIMIT;

@@ -18,6 +18,10 @@ account or key is needed for the data.
   job publishes everything in a single Pages deployment. Run it again until nothing is left (it skips what the live
   site already lists; a schedule repeats it every 6 hours).
 - `.github/workflows/t0.yml`: builds T0 in one job and publishes it with the rest of the site.
+- `.github/workflows/t2.yml`: the 10 m tier for the places in `tools/imagery/t2-plan.json.gz` (13,333 level-9 tiles of the
+  biggest cities and the populated coasts, 6,931 block archives, about 10 GB) over two more Pages projects
+  (`earthsandbox-imagery-t2a`, `-t2b`, created on demand), with its index on the main project. Best run after T1.
+  Deployments of the main project take turns, so T0, T1 and T2 never undo each other.
 - Secrets: `CLOUDFLARE_API_TOKEN` (permission: Account → Cloudflare Pages → Edit) and `CLOUDFLARE_ACCOUNT_ID`.
   Optional repository variable `PAGES_PROJECT` (default `earthsandbox-imagery`).
 
@@ -35,6 +39,8 @@ npx tsx tools/imagery/t0.ts                                                     
 world/t0/index.json, world/t0/f<face>/t0-f<face>-x<x>-y<y>.bin     T0, one archive per level-2 cell
 world/t1/manifest.json, world/t1/shards/f<face>/f<face>-x<x>-y<y>.bin   T1, one archive per level-6 cell
 world/t1/match-8k.webp                                              T1's world-wide colour match
+world/t2/index.json  (main project; `bases` names the T2 projects)  T2, one archive per level-8 block
+world/t2/list.json, world/t2/f<face>/t2-f<face>-x<x>-y<y>.bin  (each T2 project)
 ```
 
 `match-8k.webp` (8192 × 4096, lossless; per channel a linear multiplier 2^((v − 128) / 32), 128 for none) holds every T1

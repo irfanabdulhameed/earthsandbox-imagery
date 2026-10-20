@@ -1,7 +1,8 @@
 // Copies every file the live site already publishes into a local folder, so one Cloudflare Pages deployment can hold the
 // whole site again (a Pages deployment replaces the site: whatever it leaves out disappears). Files already in the
 // folder (this run's new or rebuilt ones) are kept as they are. The list comes from the site's own manifests:
-// world/t0/index.json (T0) and world/t1/manifest.json (T1). A first run, with nothing published, copies nothing.
+// world/t0/index.json (T0), world/t1/manifest.json (T1), world/t2/index.json (the main project's T2 index) and
+// world/t2/list.json (a T2 project's own blocks). A first run, with nothing published, copies nothing.
 //
 //   npx tsx tools/imagery/ci/mirror-live.ts <site folder> <site URL>
 //
@@ -42,6 +43,13 @@ if (t0) {
 }
 const t1 = await json('world/t1/manifest.json');
 if (t1) for (const s of (t1.shards as { file: string }[]) ?? []) files.push(`world/t1/${s.file}`);
+// The main project's T2 index (its archives live on the T2 projects), and a T2 project's own list and archives.
+if (await json('world/t2/index.json')) files.push('world/t2/index.json');
+const t2 = await json('world/t2/list.json');
+if (t2) {
+  files.push('world/t2/list.json');
+  for (const a of (t2.archives as { file: string }[]) ?? []) files.push(`world/${a.file}`);
+}
 const missing = files.filter((f) => !existsSync(join(dir, f)));
 console.log(`live site lists ${files.length} files; ${missing.length} to fetch (${files.length - missing.length} rebuilt in this run)`);
 let done = 0;

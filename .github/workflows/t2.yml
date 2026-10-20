@@ -1,0 +1,187 @@
+# T2: 10 m detail for the big cities and the populated coasts (tools/imagery/t2-plan.json.gz: 13,333 level-9 tiles in
+# 6,931 level-8 block archives, about 10 GB), spread over several Cloudflare Pages projects (each under Pages' 20,000
+# files: <project>-t2a, <project>-t2b, … created on demand), with one index on the main project (world/t2/index.json, its
+# `bases` naming each project) that the game reads.
+#
+# A run: 20 jobs build every 20th block not yet in the live index until their time budget runs out; then one job per
+# project gathers that project's new blocks, fetches the blocks the project already serves, and deploys it whole (a Pages
+# deployment replaces the site); last, one job rebuilds the index from every project's own list and deploys the main
+# project (with everything it already serves). Run it again until the build jobs find nothing left.
+#
+# Runners: GitHub runs 20 jobs at once for the whole account, so beside a T1 run the two share them (jobs past 20 wait their
+# turn; each build job's time budget starts when it starts). Best started after T1 is done. Deployments of the main project
+# (T0, T1's publish and this workflow's index job) take turns through the "imagery-main-deploy" group, so none of them can
+# drop another's files.
+name: T2 cities and coasts (10 m)
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: Minutes each build job takes new blocks (jobs end by 6 hours)
+        default: '300'
+      limit:
+        description: At most this many blocks per build job (empty for no limit; 1 for a quick test)
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: imagery-t2
+  cancel-in-progress: false
+
+env:
+  PAGES_PROJECT: ${{ vars.PAGES_PROJECT || 'earthsandbox-imagery' }}
+  PAGES_URL: https://${{ vars.PAGES_PROJECT || 'earthsandbox-imagery' }}.pages.dev
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      projects: ${{ steps.p.outputs.projects }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: p
+        run: |
+          P=$(node -e "const p=JSON.parse(require('zlib').gunzipSync(require('fs').readFileSync('tools/imagery/t2-plan.json.gz')));console.log(JSON.stringify(p.projects))")
+          echo "projects=$P" >> "$GITHUB_OUTPUT"
+          echo "T2 projects: $P"
+
+  build:
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        slice: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - name: Build this job's share of the blocks
+        env:
+          IMAGERY_OUT: out
+          IMAGERY_WORK: work
+          UV_THREADPOOL_SIZE: '8'
+        run: |
+          LIMIT="${{ github.event.inputs.limit }}"
+          npx tsx tools/imagery/world.ts run --tier t2 --all --workers 4 \
+            --slice ${{ matrix.slice }}/20 \
+            --published "$PAGES_URL/world/t2/index.json" \
+            --deadline-minutes "${{ github.event.inputs.minutes || '300' }}" \
+            ${LIMIT:+--limit "$LIMIT"}
+          find out/world/t2 -name '*.json' -delete 2>/dev/null || true
+          mkdir -p out/world/t2
+          echo "built $(find out/world/t2 -name '*.bin' | wc -l) blocks, $(du -sh out/world/t2 | cut -f1)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: t2-${{ matrix.slice }}
+          path: out/world/t2
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: ignore
+
+  publish:
+    needs: [plan, build]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        project: ${{ fromJSON(needs.plan.outputs.projects) }}
+    env:
+      PROJECT: ${{ vars.PAGES_PROJECT || 'earthsandbox-imagery' }}-${{ matrix.project }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - name: This run's new blocks (all projects)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: t2-*
+          path: new/world/t2
+          merge-multiple: true
+      - name: This project's share
+        id: new
+        run: |
+          npx tsx tools/imagery/world.ts site-split --tier t2 --from new --dir site --project ${{ matrix.project }}
+          N=$(find site/world/t2 -name '*.bin' 2>/dev/null | wc -l)
+          echo "count=$N" >> "$GITHUB_OUTPUT"
+          rm -rf new
+      - name: Is the project live yet?
+        id: live
+        if: steps.new.outputs.count != '0'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if npx wrangler pages project list 2>/dev/null | grep -qw "$PROJECT"; then echo "live=1" >> "$GITHUB_OUTPUT"; else echo "live=0" >> "$GITHUB_OUTPUT"; fi
+      - name: Everything the project already serves (a deployment must hold the whole site)
+        if: steps.new.outputs.count != '0' && steps.live.outputs.live == '1'
+        run: npx tsx tools/imagery/ci/mirror-live.ts site "https://$PROJECT.pages.dev"
+      - name: List, headers and pages
+        if: steps.new.outputs.count != '0'
+        run: |
+          npx tsx tools/imagery/world.ts site-list --tier t2 --dir site --project ${{ matrix.project }}
+          cp tools/imagery/ci/_headers site/_headers
+          cp tools/imagery/ci/site/index.html tools/imagery/ci/site/404.html site/
+          echo "site: $(find site -type f | wc -l) files, $(du -sh site | cut -f1) (Pages free: 20,000 files, 25 MiB each)"
+      - name: Deploy the project
+        if: steps.new.outputs.count != '0'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          npx wrangler pages project create "$PROJECT" --production-branch main >/dev/null 2>&1 || true
+          npx wrangler pages deploy site --project-name "$PROJECT" --branch main --commit-dirty=true
+
+  index:
+    needs: [plan, publish]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    concurrency:
+      group: imagery-main-deploy
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - name: Is the main project live yet?
+        id: live
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if npx wrangler pages project list 2>/dev/null | grep -qw "$PAGES_PROJECT"; then echo "live=1" >> "$GITHUB_OUTPUT"; else echo "live=0" >> "$GITHUB_OUTPUT"; fi
+      - name: Everything the main project already serves
+        if: steps.live.outputs.live == '1'
+        run: npx tsx tools/imagery/ci/mirror-live.ts site "$PAGES_URL"
+      - name: The T2 index from every project's own list
+        run: |
+          BASES=$(node -e "const p=JSON.parse('${{ needs.plan.outputs.projects }}');console.log(p.map((x)=>'https://'+process.env.PAGES_PROJECT+'-'+x+'.pages.dev/world/').join(','))")
+          npx tsx tools/imagery/world.ts site-index --tier t2 --dir site --bases "$BASES"
+          if [ -d site/world/t1/shards ]; then npx tsx tools/imagery/world.ts site-manifest --tier t1 --dir site; fi
+          cp tools/imagery/ci/_headers site/_headers
+          cp tools/imagery/ci/site/index.html tools/imagery/ci/site/404.html site/
+          echo "site: $(find site -type f | wc -l) files, $(du -sh site | cut -f1)"
+      - name: Deploy the main project
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          npx wrangler pages project create "$PAGES_PROJECT" --production-branch main >/dev/null 2>&1 || true
+          npx wrangler pages deploy site --project-name "$PAGES_PROJECT" --branch main --commit-dirty=true

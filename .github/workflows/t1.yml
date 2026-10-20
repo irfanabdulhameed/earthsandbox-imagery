@@ -23,7 +23,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: imagery-site
+  group: imagery-t1
   cancel-in-progress: false
 
 env:
@@ -74,6 +74,10 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    # Main-project deployments (this, T0's and T2's index) take turns, each mirroring the live site first.
+    concurrency:
+      group: imagery-main-deploy
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

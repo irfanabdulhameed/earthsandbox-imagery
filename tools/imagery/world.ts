@@ -10,6 +10,10 @@
 //   npx tsx tools/imagery/world.ts run --tier t1 --all --slice 3/20 --published <manifest URL> --deadline-minutes 320
 //                                                             one of 20 parallel CI jobs (.github/workflows in the builder repo)
 //   npx tsx tools/imagery/world.ts site-manifest --tier t1 --dir site   the manifest of a folder about to be published
+//   npx tsx tools/imagery/world.ts t2-plan --budget-gb 10 --project-gb 5 --save    rank the places for the 10 m tier
+//   npx tsx tools/imagery/world.ts run --tier t2 --all --slice 0/20 --published <index URL>   build T2 blocks
+//   npx tsx tools/imagery/world.ts site-list --tier t2 --dir site --project t2a      a T2 project's own list
+//   npx tsx tools/imagery/world.ts site-index --tier t2 --dir site --bases <url>,…   the main project's world/t2/index.json
 //
 // Output: a folder (IMAGERY_OUT, default tools/imagery/.cache/world-out) or an S3-compatible bucket (IMAGERY_S3_*; see
 // store.ts). Work files: IMAGERY_WORK (default tools/imagery/.cache/world-work), one folder per shard, deleted when the
@@ -18,16 +22,18 @@
 // price, dollars an hour) and IMAGERY_PUT_PRICE (dollars per 1000 writes).
 
 import { fork } from 'node:child_process';
-import { mkdirSync, readdirSync, readFileSync, statfsSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statfsSync, writeFileSync } from 'node:fs';
+import { gunzipSync, gzipSync } from 'node:zlib';
 import { join } from 'node:path';
 import sharp from 'sharp';
 import { FLAG_ALPHA, FLAG_WATER, readArchiveHead, tileKey, VERSION, writeArchive } from './archive.ts';
-import { GUTTER_PX, INNER_PX, TILE_PX } from './cube.ts';
+import { GUTTER_PX, INNER_PX, latLonToTilePixel, TILE_PX } from './cube.ts';
 import { encodeTile, SHORE_ALPHA, SHORE_MIN, SHORE_STEPS, srgbToLinear, linearToSrgb } from './finish.ts';
 import { MATCH_H, MATCH_W, worldMatch, type ShardMatch } from './match-world.ts';
-import { buildShard, type ShardStats } from './shard.ts';
+import { buildBlock, buildShard, type ShardStats } from './shard.ts';
+import { planT2, type T2Block, type T2Plan } from './t2-plan.ts';
 import { storeFromEnv, type Store } from './store.ts';
-import { BASE_MAX_LEVEL, cellAt, cellSpec, FINE_MAX_LEVEL, loadWorldMaps, parseShardId, ROOT_LEVELS, SHARD_LEVEL, worldSpecs, type ShardSpec } from './world-cells.ts';
+import { BASE_MAX_LEVEL, cellAt, cellSpec, FINE_MAX_LEVEL, fineTiles, loadWorldMaps, parseShardId, ROOT_LEVELS, SHARD_LEVEL, worldSpecs, type ShardSpec } from './world-cells.ts';
 
 const ROOT = new URL('../..', import.meta.url).pathname;
 const CACHE = join(ROOT, 'tools/imagery/.cache');
@@ -37,12 +43,18 @@ const arg = (argv: string[], k: string) => {
   const i = argv.indexOf(`--${k}`);
   return i >= 0 ? argv[i + 1] : undefined;
 };
-// The free plan's T1 (80 m base, no 10 m tier) lives beside the full shards: --tier t1.
+// The free plan's T1 (80 m base, no 10 m tier) lives beside the full shards: --tier t1. T2's level-8 blocks: --tier t2.
 let TIER_PREFIX = 'world';
 const shardKey = (id: string) => {
+  if (TIER_PREFIX === 'world/t2') {
+    const m = /f(\d)-x\d+-y\d+$/.exec(id);
+    return `world/t2/f${m?.[1]}/${id}`;
+  }
   const { face } = parseShardId(id);
   return `${TIER_PREFIX}/shards/f${face}/${id}`;
 };
+// The T2 plan kept in the repository (so blocks never move between projects), else made from the maps.
+const T2_PLAN_FILE = join(ROOT, 'tools/imagery/t2-plan.json.gz');
 const t0 = Date.now();
 const log = (s: string) => console.log(`[${new Date().toISOString().slice(11, 19)} +${((Date.now() - t0) / 1000).toFixed(0)}s] ${s}`);
 const freeGB = (dir: string) => {
@@ -54,7 +66,59 @@ const freeGB = (dir: string) => {
   }
 };
 
+/** T2's blocks as runner specs (one level-8 block each, its picked level-9 tiles in `tiles`). */
+async function loadT2(store: Store, argv: string[]): Promise<ShardSpec[]> {
+  const plan = await t2Plan(store, argv);
+  const toSpec = (b: T2Block): ShardSpec => ({
+    id: b.id,
+    face: b.face,
+    x: b.x,
+    y: b.y,
+    land: 1,
+    fine: '',
+    fineCount: b.tiles.length,
+    lat: b.lat,
+    lon: b.lon,
+    snow: false,
+    tiles: b.tiles.map(([x, y]) => ({ x, y })),
+    project: b.project,
+  });
+  const at = arg(argv, 'at');
+  if (at) {
+    // The planned block holding each point, else that block with the full plan's 10 m picks inside it.
+    const maps = await loadWorldMaps();
+    return at.split(';').map((p) => {
+      const [lat, lon] = p.split(',').map(Number);
+      const c8 = latLonToTilePixel(lat, lon, 8);
+      const id = `t2-f${c8.face}-x${c8.x}-y${c8.y}`;
+      const b = plan.blocks.find((q) => q.id === id);
+      if (b) return { ...toSpec(b), focus: [lat, lon] as [number, number] };
+      const c6 = cellAt(lat, lon);
+      const spec = cellSpec(maps, c6.face, c6.x, c6.y);
+      const tiles = (spec ? fineTiles(spec) : []).filter((t) => t.x >> 1 === c8.x && t.y >> 1 === c8.y);
+      if (!tiles.length) throw new Error(`no 10 m pick in the block at ${p}`);
+      return { ...toSpec({ id, face: c8.face, x: c8.x, y: c8.y, tiles: tiles.map((t) => [t.x, t.y]), project: -1, score: 0, lat, lon }), focus: [lat, lon] as [number, number] };
+    });
+  }
+  const proj = arg(argv, 'project');
+  return plan.blocks.filter((b) => proj === undefined || plan.projects[b.project] === proj).map(toSpec);
+}
+
+/** The T2 plan: the repository's file, else the store's, else made now (and saved to the store). */
+async function t2Plan(store: Store, argv: string[]): Promise<T2Plan> {
+  if (!argv.includes('--fresh') && existsSync(T2_PLAN_FILE)) return JSON.parse(gunzipSync(readFileSync(T2_PLAN_FILE)).toString('utf8')) as T2Plan;
+  const saved = await store.get('world/t2/plan.json');
+  if (saved && !argv.includes('--fresh')) return JSON.parse(new TextDecoder().decode(saved)) as T2Plan;
+  const maps = await loadWorldMaps();
+  const land = await store.get('world/plan.json');
+  const specs = land ? (JSON.parse(new TextDecoder().decode(land)) as { shards: ShardSpec[] }).shards : worldSpecs(maps);
+  const plan = planT2(maps, specs, Number(arg(argv, 'budget-gb') ?? 10), Number(arg(argv, 'project-gb') ?? 5));
+  await store.put('world/t2/plan.json', new TextEncoder().encode(JSON.stringify(plan)), 'application/json');
+  return plan;
+}
+
 async function loadPlan(store: Store, argv: string[]): Promise<ShardSpec[]> {
+  if (TIER_PREFIX === 'world/t2') return loadT2(store, argv);
   const maps = await loadWorldMaps();
   const at = arg(argv, 'at');
   const ids = arg(argv, 'shards');
@@ -105,7 +169,8 @@ async function run(store: Store, argv: string[]) {
   if (pub) {
     try {
       const text = /^https?:/.test(pub) ? await (await fetch(pub)).text() : readFileSync(pub, 'utf8');
-      for (const sh of (JSON.parse(text) as { shards?: { id: string }[] }).shards ?? []) published.add(sh.id);
+      const listing = JSON.parse(text) as { shards?: { id: string }[]; archives?: { id: string }[] };
+      for (const sh of [...(listing.shards ?? []), ...(listing.archives ?? [])]) published.add(sh.id);
     } catch {
       log(`no published manifest at ${pub}: building every shard of the slice`);
     }
@@ -116,7 +181,7 @@ async function run(store: Store, argv: string[]) {
   const queue = todo.slice(0, limit);
   log(`${mine.length} shards asked${slice ? ` (slice ${slice[0]} of ${slice[1]})` : ''}, ${published.size ? `${mine.length - todo.length} already built or published` : `${mine.length - todo.length} already built`}, ${queue.length} to build with ${workers} workers into ${store.describe}`);
   if (!queue.length) return;
-  const workArgs = ['worker', '--per-orbit', arg(argv, 'per-orbit') ?? (arg(argv, 'tier') === 't1' ? '3' : '7'), '--quality', arg(argv, 'quality') ?? '74'];
+  const workArgs = ['worker', '--per-orbit', arg(argv, 'per-orbit') ?? (arg(argv, 'tier') === 't1' ? '3' : arg(argv, 'tier') === 't2' ? '5' : '7'), '--quality', arg(argv, 'quality') ?? '74'];
   if (arg(argv, 'tier')) workArgs.push('--tier', arg(argv, 'tier')!);
   if (arg(argv, 'max-fine-blocks')) workArgs.push('--max-fine-blocks', arg(argv, 'max-fine-blocks')!);
   let done = 0;
@@ -177,14 +242,18 @@ function worker(store: Store, argv: string[]) {
   mkdirSync(work, { recursive: true });
   process.on('message', async (m: { spec: ShardSpec }) => {
     try {
-      const { archive, stats } = await buildShard(m.spec, {
+      const options = {
         work,
         perOrbit: Number(arg(argv, 'per-orbit') ?? 7),
         quality: Number(arg(argv, 'quality') ?? 74),
         maxFineBlocks: arg(argv, 'max-fine-blocks') ? Number(arg(argv, 'max-fine-blocks')) : undefined,
         t1: arg(argv, 'tier') === 't1',
         log,
-      });
+      };
+      const { archive, stats } =
+        arg(argv, 'tier') === 't2'
+          ? await buildBlock({ id: m.spec.id, face: m.spec.face, x: m.spec.x, y: m.spec.y, tiles: m.spec.tiles ?? [], lat: m.spec.lat, lon: m.spec.lon }, options)
+          : await buildShard(m.spec, options);
       await store.put(`${shardKey(m.spec.id)}.bin`, archive);
       await store.put(`${shardKey(m.spec.id)}.json`, new TextEncoder().encode(JSON.stringify(stats)), 'application/json');
       process.send!({ ok: true, stats });
@@ -429,8 +498,89 @@ const insideAny = (spec: ShardSpec, lat: number, lon: number) => {
   return c.face === spec.face && c.x === spec.x && c.y === spec.y;
 };
 
+/** T2's plan: ranks the places, writes the plan to the store and, with --save, to the repository's t2-plan.json.gz. */
+async function t2PlanCommand(store: Store, argv: string[]) {
+  const plan = await t2Plan(store, [...argv, '--fresh']);
+  if (argv.includes('--save')) writeFileSync(T2_PLAN_FILE, gzipSync(JSON.stringify(plan), { level: 9 }));
+  const per = plan.projects.map((p, k) => `${p}: ${plan.blocks.filter((b) => b.project === k).length} blocks`);
+  log(`T2 plan: ${plan.tiles} level-9 tiles (${plan.people.toLocaleString('en')} people) in ${plan.blocks.length} blocks, about ${((plan.tiles * plan.estMBPerTile) / 1000).toFixed(1)} GB; ${per.join(', ')}`);
+}
+
+/**
+ * The publish steps of T2: `site-list --tier t2 --dir <site> --project t2a` writes the project's own world/t2/list.json from
+ * the block archives in its folder; `site-index --tier t2 --dir <main site> --bases <url>,<url>…` gathers every project's
+ * list (fetched from each base) into the main project's world/t2/index.json, each archive pointing at its base by index.
+ */
+async function siteList(argv: string[]) {
+  const dir = arg(argv, 'dir');
+  if (!dir) throw new Error('site-list: --dir is required');
+  const root = join(dir, 'world/t2');
+  const archives: Record<string, unknown>[] = [];
+  for (const f of existsSync(root) ? readdirSync(root).filter((n) => /^f\d$/.test(n)).sort() : [])
+    for (const name of readdirSync(join(root, f)).filter((n) => n.endsWith('.bin')).sort()) {
+      const bytes = readFileSync(join(root, f, name));
+      const head = readArchiveHead(new Uint8Array(bytes.buffer, bytes.byteOffset, Math.min(bytes.length, 1 << 20)));
+      const cell = head.meta.cell as { face: number; x: number; y: number };
+      archives.push({ id: name.replace(/\.bin$/, ''), face: cell.face, x: cell.x, y: cell.y, file: `t2/${f}/${name}`, bytes: bytes.length, maxLevel: head.meta.maxLevel });
+    }
+  const list = { version: 3, tier: 'T2', project: arg(argv, 'project') ?? '', cellLevel: 8, levels: [10, 11], archives };
+  mkdirSync(root, { recursive: true });
+  writeFileSync(join(root, 'list.json'), JSON.stringify(list));
+  log(`T2 list: ${archives.length} archives in ${join(root, 'list.json')}`);
+}
+
+/** `site-split --tier t2 --from <folder> --dir <site> --project t2a`: copies the project's blocks (by the plan) from a
+ *  folder of new blocks (all projects mixed, as the build jobs hand them over) into that project's site folder. */
+async function siteSplit(argv: string[]) {
+  const from = arg(argv, 'from');
+  const dir = arg(argv, 'dir');
+  const proj = arg(argv, 'project');
+  if (!from || !dir || !proj) throw new Error('site-split: --from, --dir and --project are required');
+  const plan = JSON.parse(gunzipSync(readFileSync(T2_PLAN_FILE)).toString('utf8')) as T2Plan;
+  const k = plan.projects.indexOf(proj);
+  const mine = new Set(plan.blocks.filter((b) => b.project === k).map((b) => b.id));
+  let n = 0;
+  const root = join(from, 'world/t2');
+  for (const f of existsSync(root) ? readdirSync(root).filter((x) => /^f\d$/.test(x)) : [])
+    for (const name of readdirSync(join(root, f)).filter((x) => x.endsWith('.bin'))) {
+      if (!mine.has(name.replace(/\.bin$/, ''))) continue;
+      mkdirSync(join(dir, 'world/t2', f), { recursive: true });
+      copyFileSync(join(root, f, name), join(dir, 'world/t2', f, name));
+      n++;
+    }
+  log(`T2 split: ${n} new blocks of ${proj} into ${dir}`);
+}
+
+async function siteIndex(argv: string[]) {
+  const dir = arg(argv, 'dir');
+  const bases = (arg(argv, 'bases') ?? '').split(',').filter(Boolean).map((b) => (b.endsWith('/') ? b : `${b}/`));
+  if (!dir || !bases.length) throw new Error('site-index: --dir and --bases are required');
+  const archives: Record<string, unknown>[] = [];
+  for (const [k, b] of bases.entries()) {
+    let list: { archives?: Record<string, unknown>[] } | null = null;
+    for (let attempt = 0; attempt < 5 && !list; attempt++) {
+      try {
+        const res = await fetch(new URL('t2/list.json', b));
+        if (res.status === 404) break;
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const text = await res.text();
+        list = text.trimStart().startsWith('{') ? (JSON.parse(text) as { archives?: Record<string, unknown>[] }) : { archives: [] };
+      } catch (err) {
+        if (attempt === 4) throw new Error(`${b}t2/list.json: ${String(err)}`);
+        await new Promise((r) => setTimeout(r, 2000 * 2 ** attempt));
+      }
+    }
+    for (const a of list?.archives ?? []) archives.push({ ...a, base: k });
+  }
+  const index = { version: 3, tier: 'T2', cellLevel: 8, levels: [10, 11], bases, archives };
+  mkdirSync(join(dir, 'world/t2'), { recursive: true });
+  writeFileSync(join(dir, 'world/t2/index.json'), JSON.stringify(index));
+  log(`T2 index: ${archives.length} archives over ${bases.length} projects in ${join(dir, 'world/t2/index.json')}`);
+}
+
 async function main(argv: string[]) {
   if (arg(argv, 'tier') === 't1') TIER_PREFIX = 'world/t1';
+  if (arg(argv, 'tier') === 't2') TIER_PREFIX = 'world/t2';
   const store = storeFromEnv(process.env, join(CACHE, 'world-out'));
   const cmd = argv[0];
   if (cmd === 'worker') return worker(store, argv);
@@ -440,6 +590,10 @@ async function main(argv: string[]) {
   if (cmd === 'manifest') return manifest(store, argv);
   if (cmd === 'shots') return shots(store, argv);
   if (cmd === 'site-manifest') return siteManifest(argv);
+  if (cmd === 't2-plan') return t2PlanCommand(store, argv);
+  if (cmd === 'site-list') return siteList(argv);
+  if (cmd === 'site-index') return siteIndex(argv);
+  if (cmd === 'site-split') return siteSplit(argv);
   console.log('usage: world.ts plan | run [--all | --shards ids | --at lat,lon;…] [--workers N] [--per-orbit 7] [--max-fine-blocks K] [--limit M] | root | manifest');
 }
 

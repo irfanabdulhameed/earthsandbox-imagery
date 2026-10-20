@@ -238,22 +238,31 @@ function renderMulti(sources: Source[], face: number, level: number, x: number, 
 
 /** The match field to color-8k over a cell, from the cell's own level-6 tile (linear means per color-8k pixel). */
 async function matchFromTile(face: number, x: number, y: number, rgba: Uint8Array) {
+  return matchFromTiles(face, SHARD_LEVEL, [{ x, y, rgba }]);
+}
+
+/** The match field to color-8k from some tiles of one level (linear means per color-8k pixel). */
+async function matchFromTiles(face: number, level: number, tiles: { x: number; y: number; rgba: Uint8Array }[]) {
   const c8k = await sharp(join(new URL('../..', import.meta.url).pathname, 'public/earth/color-8k.avif')).removeAlpha().raw().toBuffer();
   const sums = new Map<number, number[]>();
-  const { s, a0, b1 } = tileBounds(SHARD_LEVEL, x, y);
-  for (let j = GUTTER_PX; j < TILE_PX - GUTTER_PX; j++)
-    for (let i = GUTTER_PX; i < TILE_PX - GUTTER_PX; i++) {
-      const o = (j * TILE_PX + i) * 4;
-      if (!rgba[o + 3]) continue;
-      const ll = dirToLatLon(faceToDir(face, a0 + ((i + 0.5 - GUTTER_PX) * s) / INNER_PX, b1 - ((j + 0.5 - GUTTER_PX) * s) / INNER_PX));
-      const col = Math.floor(((ll.lon + 180) / 360) * C8K_W) % C8K_W;
-      const row = Math.min(C8K_H - 1, Math.floor(((90 - ll.lat) / 180) * C8K_H));
-      const key = row * C8K_W + col;
-      const v = sums.get(key) ?? [0, 0, 0, 0];
-      for (let b = 0; b < 3; b++) v[b] += srgbToLinear(rgba[o + b] / 255);
-      v[3]++;
-      sums.set(key, v);
-    }
+  // (Every other pixel is plenty for 4.9 km cells.)
+  const step = level > SHARD_LEVEL ? 2 : 1;
+  for (const { x, y, rgba } of tiles) {
+    const { s, a0, b1 } = tileBounds(level, x, y);
+    for (let j = GUTTER_PX; j < TILE_PX - GUTTER_PX; j += step)
+      for (let i = GUTTER_PX; i < TILE_PX - GUTTER_PX; i += step) {
+        const o = (j * TILE_PX + i) * 4;
+        if (!rgba[o + 3]) continue;
+        const ll = dirToLatLon(faceToDir(face, a0 + ((i + 0.5 - GUTTER_PX) * s) / INNER_PX, b1 - ((j + 0.5 - GUTTER_PX) * s) / INNER_PX));
+        const col = Math.floor(((ll.lon + 180) / 360) * C8K_W) % C8K_W;
+        const row = Math.min(C8K_H - 1, Math.floor(((90 - ll.lat) / 180) * C8K_H));
+        const key = row * C8K_W + col;
+        const v = sums.get(key) ?? [0, 0, 0, 0];
+        for (let b = 0; b < 3; b++) v[b] += srgbToLinear(rgba[o + b] / 255);
+        v[3]++;
+        sums.set(key, v);
+      }
+  }
   if (!sums.size) return null;
   const keys = [...sums.keys()];
   const cols = keys.map((k) => k % C8K_W);
@@ -471,3 +480,131 @@ export async function buildShard(spec: ShardSpec, opts: ShardOptions): Promise<{
   return { archive, stats };
 }
 
+
+/** A T2 block: the 10 m tier over some level-9 tiles of one level-8 block (docs/imagery-tiles.md, "The free tiers"). */
+export interface BlockJob {
+  id: string;
+  face: number;
+  x: number;
+  y: number;
+  /** The picked level-9 tiles inside the block. */
+  tiles: { x: number; y: number }[];
+  lat: number;
+  lon: number;
+}
+
+/**
+ * Builds one T2 block's archive: its own dates (the clearest, least hazy of the season for its latitude), one 10 m composite
+ * per UTM zone over its picked level-9 tiles only, water at 20 m, levels 10 and 11, and its colour match to color-8k.
+ */
+export async function buildBlock(job: BlockJob, opts: ShardOptions): Promise<{ archive: Uint8Array; stats: ShardStats }> {
+  const t0 = Date.now();
+  const cpu0 = process.cpuUsage();
+  const net0 = netStats.bytes;
+  const log = (m: string) => opts.log(`${job.id}: ${m}`);
+  const work = join(opts.work, job.id);
+  mkdirSync(work, { recursive: true });
+  const { face, x, y } = job;
+  const inside = (lat: number, lon: number) => usable(lat) && insideTile(face, 8, x, y, lat, lon) && job.tiles.some((t) => insideTile(face, FINE_PICK_LEVEL, t.x, t.y, lat, lon));
+  const boxes = tileBoxes(face, 8, x, y, 0.02);
+  const zones = new Map<string, Zone>();
+  for (const t of job.tiles) for (const p of tilePoints(face, FINE_PICK_LEVEL, t.x, t.y, 12)) if (usable(p.lat)) zones.set(zoneKey(s2Zone(p.lat, p.lon)), s2Zone(p.lat, p.lon));
+  const ranges = seasonFor(job.lat);
+  const scenes = new Map<string, Scene>();
+  for (const b of boxes) for (const sc of await searchScenes(work, b, ranges, 30)) scenes.set(sc.id, sc);
+  // The 10 clearest acquisitions an orbit, each whole.
+  const byTake = new Map<string, Scene[]>();
+  for (const sc of scenes.values()) byTake.set(sc.datatake, [...(byTake.get(sc.datatake) ?? []), sc]);
+  const byOrbit = new Map<number, { take: string; cloud: number }[]>();
+  for (const [take, list] of byTake) byOrbit.set(list[0].orbit, [...(byOrbit.get(list[0].orbit) ?? []), { take, cloud: list.reduce((a, sc) => a + sc.cloud, 0) / list.length }]);
+  const keep = new Set<string>();
+  for (const list of byOrbit.values()) for (const t of list.sort((p, q) => p.cloud - q.cloud || (p.take < q.take ? -1 : 1)).slice(0, 10)) for (const sc of byTake.get(t.take)!) keep.add(sc.id);
+  const kept = [...scenes.values()].filter((sc) => keep.has(sc.id)).sort((p, q) => (p.id < q.id ? -1 : 1));
+  log(`${scenes.size} scenes, ${kept.length} kept; zones ${[...zones.keys()].join(', ')}`);
+  const sources: Source[] = [];
+  const dates = new Set<string>();
+  for (const [zk, zone] of [...zones.entries()].sort()) {
+    const mine = kept.filter((sc) => sc.epsg === epsgOf(zone));
+    if (!mine.length) continue;
+    const inZone = (lat: number, lon: number) => inside(lat, lon) && zoneEdgeKm(zone, lat, lon) > -ZONE_REACH_KM;
+    const grid = gridOver(boxes, zone, 10, inZone, mine[0].n0, 800);
+    if (!grid) continue;
+    const plan = await planComposite(grid, mine, boxes[0], { perOrbit: opts.perOrbit, minOrbitShare: 0.03, blendKm: 12, log, inside: inZone, snowClear: false });
+    if (!plan.takes.length) continue;
+    const key = hash({ grid, takes: plan.takes.map((t) => t.datatake), v: 'T2' });
+    const comp = await buildComposite(plan, work, key, log);
+    const water = await buildWater(plan, comp, work, key, log);
+    for (const t of plan.takes) dates.add(t.date);
+    sources.push(withRamp({ zone, grid, plan, comp, pyr: toneAndPyramid(comp, WORLD_FIT, { highlights: true }), water }));
+    log(`zone ${zk}: 10 m composite ${grid.w} × ${grid.h} from ${plan.takes.length} dates`);
+  }
+  if (!sources.length) throw new Error(`${job.id}: no Sentinel-2 scenes`);
+  const mid = dirToFace(latLonToDir(job.lat, job.lon));
+  const levelM = (level: number) => Math.round(pixelMetres(level, mid.a, mid.b) * 100) / 100;
+  const tiles: { face: number; level: number; x: number; y: number; flags: number; data: Uint8Array }[] = [];
+  const levels: { level: number; tiles: number; bytes: number; pixelM: number }[] = [];
+  const forMatch: { x: number; y: number; rgba: Uint8Array }[] = [];
+  for (let level = FINE_PICK_LEVEL + 1; level <= FINE_MAX_LEVEL; level++) {
+    const per = 2 ** (level - FINE_PICK_LEVEL);
+    for (const t of job.tiles)
+      for (let j = 0; j < per; j++)
+        for (let i = 0; i < per; i++) {
+          const tx = t.x * per + i;
+          const ty = t.y * per + j;
+          const r = renderMulti(sources, face, level, tx, ty, levelM(level));
+          if (!r.any) continue;
+          const data = await encodeTile(r.rgba, false, opts.quality);
+          tiles.push({ face, level, x: tx, y: ty, flags: FLAG_ALPHA | (r.wet ? FLAG_WATER : 0), data });
+          if (level === FINE_PICK_LEVEL + 1) forMatch.push({ x: tx, y: ty, rgba: r.rgba });
+          let L = levels.find((l) => l.level === level);
+          if (!L) levels.push((L = { level, tiles: 0, bytes: 0, pixelM: levelM(level) }));
+          L.tiles++;
+          L.bytes += data.length;
+        }
+    log(`level ${level}: ${levels.find((l) => l.level === level)?.tiles ?? 0} tiles`);
+  }
+  const match = await matchFromTiles(face, FINE_PICK_LEVEL + 1, forMatch);
+  const meta = {
+    version: VERSION,
+    layout: 3,
+    tier: 'T2',
+    name: job.id,
+    cell: { face, x, y, level: 8 },
+    picked: job.tiles.map((t) => [t.x, t.y]),
+    bbox: boxes[0],
+    format: 'webp',
+    mime: 'image/webp',
+    tileSize: TILE_PX,
+    gutter: GUTTER_PX,
+    inner: INNER_PX,
+    minLevel: FINE_PICK_LEVEL + 1,
+    maxLevel: FINE_MAX_LEVEL,
+    colourSpace: 'srgb',
+    alpha: 'straight',
+    featherKm: 0,
+    shore: { alpha: SHORE_ALPHA, stepsPerPixel: SHORE_STEPS, min: SHORE_MIN, max: 255, none: 0, landPositive: true },
+    levels,
+    source: 'Contains modified Copernicus Sentinel data (Sentinel-2 L2A, collection 1), read from Earth Search on AWS',
+    zones: sources.map((b) => zoneKey(b.zone)),
+    dates: [...dates].sort(),
+    colour: { dark: WORLD_DARK, gain: TONE.gain, power: TONE.power, saturation: TONE.sat, bakedMatch: 0 },
+    match,
+    tool: 'tools/imagery/world.ts --tier t2',
+  };
+  const archive = writeArchive(meta, tiles);
+  rmSync(work, { recursive: true, force: true });
+  const cpu = process.cpuUsage(cpu0);
+  const stats: ShardStats = {
+    id: job.id,
+    bytes: archive.length,
+    tiles: tiles.length,
+    fineTiles: tiles.length,
+    zones: meta.zones,
+    dates: meta.dates,
+    downloadMB: Math.round((netStats.bytes - net0) / 1e5) / 10,
+    cpuSeconds: Math.round((cpu.user + cpu.system) / 1e6),
+    seconds: Math.round((Date.now() - t0) / 1000),
+  };
+  log(`done: ${(archive.length / 1e6).toFixed(2)} MB, ${tiles.length} tiles, ${stats.downloadMB} MB read, ${stats.seconds} s`);
+  return { archive, stats };
+}
