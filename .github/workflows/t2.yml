@@ -24,6 +24,9 @@ on:
       limit:
         description: At most this many blocks per build job (empty for no limit; 1 for a quick test)
         default: ''
+      index_only:
+        description: 1 to skip building and publishing and only rebuild the index from what the projects already serve
+        default: ''
 
 permissions:
   contents: read
@@ -51,6 +54,7 @@ jobs:
 
   build:
     needs: plan
+    if: ${{ github.event.inputs.index_only != '1' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 350
     strategy:
@@ -151,7 +155,7 @@ jobs:
 
   publish:
     needs: [plan, build]
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && github.event.inputs.index_only != '1' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     strategy:
@@ -234,8 +238,11 @@ jobs:
         if: steps.live.outputs.live == '1'
         run: npx tsx tools/imagery/ci/mirror-live.ts site "$PAGES_URL"
       - name: The T2 index from every project's own list
+        # The project list comes in through the environment: pasted into the script, the shell ate its JSON quotes.
+        env:
+          PROJECTS: ${{ needs.plan.outputs.projects }}
         run: |
-          BASES=$(node -e "const p=JSON.parse('${{ needs.plan.outputs.projects }}');console.log(p.map((x)=>'https://'+process.env.PAGES_PROJECT+'-'+x+'.pages.dev/world/').join(','))")
+          BASES=$(node -e "const p=JSON.parse(process.env.PROJECTS);console.log(p.map((x)=>'https://'+process.env.PAGES_PROJECT+'-'+x+'.pages.dev/world/').join(','))")
           npx tsx tools/imagery/world.ts site-index --tier t2 --dir site --bases "$BASES"
           if [ -d site/world/t1/shards ]; then npx tsx tools/imagery/world.ts site-manifest --tier t1 --dir site; fi
           cp tools/imagery/ci/_headers site/_headers
