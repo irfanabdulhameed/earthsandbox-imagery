@@ -137,6 +137,26 @@ export async function openCog(url: string): Promise<Cog> {
   return { url, ifds };
 }
 
+// Headers already read, shared by the composite and the water passes of one shard. A long run builds hundreds of shards
+// in one process, so the runner empties it after each (forgetCogs); a header that failed to load is not kept.
+const opened = new Map<string, Promise<Cog>>();
+
+/** A COG's header, read once while a shard is being built. */
+export function cachedCog(url: string): Promise<Cog> {
+  let c = opened.get(url);
+  if (!c) {
+    const p = openCog(url);
+    p.catch(() => {
+      if (opened.get(url) === p) opened.delete(url);
+    });
+    opened.set(url, (c = p));
+  }
+  return c;
+}
+
+/** Drops every cached header (after each shard). */
+export const forgetCogs = () => opened.clear();
+
 /** Decodes one internal tile to its samples (row-major, tileWidth × tileHeight). Missing tiles are all zero. */
 export async function readTile(cog: Cog, level: number, tx: number, ty: number): Promise<Uint16Array | Uint8Array> {
   const ifd = cog.ifds[level];

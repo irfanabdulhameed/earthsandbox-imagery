@@ -14,7 +14,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { deflateSync, inflateSync } from 'node:zlib';
-import { openCog, readWindow, type Cog } from './cog.ts';
+import { cachedCog, readWindow, type Cog } from './cog.ts';
 import type { Scene } from './stac.ts';
 import { fromUtm, toUtm, type Zone } from './utm.ts';
 
@@ -102,12 +102,7 @@ export function makeGrid(bbox: number[], zone: Zone, marginM: number, alignN0: n
   return { zone, e0, n0, w: (e1 - e0) / res, h: Math.ceil((n0 - bottom) / res), res };
 }
 
-const cogs = new Map<string, Promise<Cog>>();
-const cog = (url: string) => {
-  let c = cogs.get(url);
-  if (!c) cogs.set(url, (c = openCog(url)));
-  return c;
-};
+const cog = cachedCog;
 
 /** The overview level of a COG whose pixel is `factor` times the full-resolution one. */
 function overview(c: Cog, factor: number): number {
@@ -176,6 +171,19 @@ function median(v: number[] | Float64Array, n: number): number {
     v[j + 1] = x;
   }
   return n % 2 ? v[(n - 1) >> 1] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
+}
+
+/** Acquisitions scored at once: enough to keep the network busy, few enough that their coarse rasters stay small. */
+const SCORE_PARALLEL = 6;
+
+/** Runs `fn` over the items, at most `n` at a time. */
+async function inTurn<T>(items: T[], n: number, fn: (item: T) => Promise<void>): Promise<void> {
+  let next = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(n, items.length) }, async () => {
+      while (next < items.length) await fn(items[next++]);
+    }),
+  );
 }
 
 /** Squared-free chamfer distance (in pixels) from every pixel to the nearest zero of `mask`; the border counts as set. */
@@ -253,59 +261,63 @@ export async function planComposite(grid: Grid, scenes: Scene[], bbox: number[],
   interface Coarse {
     take: Take;
     scl: Uint8Array;
-    rgb: Float32Array[]; // reflectance
   }
+  // One acquisition on the coarse grid: per pixel the classification and reflectance of the first of its tiles that sees
+  // it. Only the classification is kept for every acquisition; the colour is read again for the chosen ones, orbit by
+  // orbit (near the poles a box has 150 to 200 candidate acquisitions, and holding all their colour at once took gigabytes).
+  const readTake = async (group: Scene[]) => {
+    const scl = new Uint8Array(cw * ch);
+    const rgb = [new Float32Array(cw * ch), new Float32Array(cw * ch), new Float32Array(cw * ch)];
+    for (const s of group) {
+      const [a, r, g, b] = await Promise.all([
+        readOnto(s.href.scl, s, 20, 8, 0, 0, cw, ch, cpx, grid),
+        readOnto(s.href.red, s, 10, 16, 0, 0, cw, ch, cpx, grid),
+        readOnto(s.href.green, s, 10, 16, 0, 0, cw, ch, cpx, grid),
+        readOnto(s.href.blue, s, 10, 16, 0, 0, cw, ch, cpx, grid),
+      ]);
+      if (!a || !r || !g || !b) continue;
+      for (let i = 0; i < cw * ch; i++) {
+        if (scl[i]) continue;
+        const k = a.map[i];
+        const kr = r.map[i];
+        if (k < 0 || kr < 0 || !a.data[k] || !r.data[kr]) continue;
+        scl[i] = a.data[k];
+        rgb[0][i] = r.data[kr] * s.scale + s.offset;
+        rgb[1][i] = g.data[g.map[i]] * s.scale + s.offset;
+        rgb[2][i] = b.data[b.map[i]] * s.scale + s.offset;
+      }
+    }
+    return { scl, rgb };
+  };
   const coarse: Coarse[] = [];
   const keys = [...byTake.keys()].sort();
   let done = 0;
-  await Promise.all(
-    keys.map(async (key) => {
-      const group = byTake.get(key)!;
-      const scl = new Uint8Array(cw * ch);
-      const rgb = [new Float32Array(cw * ch), new Float32Array(cw * ch), new Float32Array(cw * ch)];
-      for (const s of group) {
-        const [a, r, g, b] = await Promise.all([
-          readOnto(s.href.scl, s, 20, 8, 0, 0, cw, ch, cpx, grid),
-          readOnto(s.href.red, s, 10, 16, 0, 0, cw, ch, cpx, grid),
-          readOnto(s.href.green, s, 10, 16, 0, 0, cw, ch, cpx, grid),
-          readOnto(s.href.blue, s, 10, 16, 0, 0, cw, ch, cpx, grid),
-        ]);
-        if (!a || !r || !g || !b) continue;
-        for (let i = 0; i < cw * ch; i++) {
-          if (scl[i]) continue;
-          const k = a.map[i];
-          const kr = r.map[i];
-          if (k < 0 || kr < 0 || !a.data[k] || !r.data[kr]) continue;
-          scl[i] = a.data[k];
-          rgb[0][i] = r.data[kr] * s.scale + s.offset;
-          rgb[1][i] = g.data[g.map[i]] * s.scale + s.offset;
-          rgb[2][i] = b.data[b.map[i]] * s.scale + s.offset;
-        }
-      }
-      let covered = 0;
-      let clearN = 0;
-      const blues: number[] = [];
-      for (let i = 0; i < cw * ch; i++) {
-        if (!inBox[i] || !scl[i]) continue;
-        covered++;
-        if (clear.has(scl[i])) clearN++;
-        if (scl[i] === 4) blues.push(rgb[2][i]);
-      }
-      const s0 = group[0];
-      const take: Take = {
-        datatake: key,
-        orbit: s0.orbit,
-        date: s0.datetime.slice(0, 10),
-        scenes: group.sort((p, q) => (p.id < q.id ? -1 : 1)),
-        covered: covered / boxCount,
-        clear: covered ? clearN / covered : 0,
-        haze: blues.length ? median(Float64Array.from(blues), blues.length) : 1,
-      };
-      coarse.push({ take, scl, rgb });
-      done++;
-      if (done % 10 === 0) opts.log(`  scored ${done}/${keys.length} acquisitions`);
-    }),
-  );
+  await inTurn(keys, SCORE_PARALLEL, async (key) => {
+    const group = byTake.get(key)!;
+    const { scl, rgb } = await readTake(group);
+    let covered = 0;
+    let clearN = 0;
+    const blues: number[] = [];
+    for (let i = 0; i < cw * ch; i++) {
+      if (!inBox[i] || !scl[i]) continue;
+      covered++;
+      if (clear.has(scl[i])) clearN++;
+      if (scl[i] === 4) blues.push(rgb[2][i]);
+    }
+    const s0 = group[0];
+    const take: Take = {
+      datatake: key,
+      orbit: s0.orbit,
+      date: s0.datetime.slice(0, 10),
+      scenes: [...group].sort((p, q) => (p.id < q.id ? -1 : 1)),
+      covered: covered / boxCount,
+      clear: covered ? clearN / covered : 0,
+      haze: blues.length ? median(Float64Array.from(blues), blues.length) : 1,
+    };
+    coarse.push({ take, scl });
+    done++;
+    if (done % 10 === 0) opts.log(`  scored ${done}/${keys.length} acquisitions`);
+  });
   coarse.sort((p, q) => (p.take.datatake < q.take.datatake ? -1 : 1));
 
   // Choose per orbit.
@@ -315,6 +327,12 @@ export async function planComposite(grid: Grid, scenes: Scene[], bbox: number[],
     .filter(([, share]) => share >= opts.minOrbitShare)
     .sort((p, q) => q[1] - p[1] || p[0] - q[0])
     .map(([o]) => o);
+  // A zone's strip at the edge of the cell can lie almost wholly outside the passes filed under that zone: nothing to
+  // compose here (the neighbouring zone's composite reaches across).
+  if (!orbits.length) {
+    opts.log(`  no orbit sees ${Math.round(100 * opts.minOrbitShare)}% of the area: left to the neighbouring zone`);
+    return { grid, takes: [], orbits: [], gains: {}, weights: {}, cw, ch, snowClear: !!opts.snowClear };
+  }
   const chosen: Coarse[] = [];
   for (const o of orbits) {
     const share = orbitShare.get(o) ?? 0;
@@ -352,57 +370,62 @@ export async function planComposite(grid: Grid, scenes: Scene[], bbox: number[],
     opts.log(`  gap fill: ${best.take.date} (orbit R${String(best.take.orbit).padStart(3, '0')}) sees ${((100 * bestGain) / boxCount).toFixed(1)}% of the box no chosen date saw`);
   }
 
-  // Per-orbit coarse medians, coverage and the gains that match each orbit to the ones before it.
+  coarse.length = 0; // only the chosen ones from here on
+
+  // Per orbit (reference first): its coarse median, its coverage, and the gain that matches it to the orbits before it.
+  // Gains are measured on land only (vegetation or bare ground on some chosen date): sea and glint differ from date to
+  // date and would skew them. Too little land shared, or an implausible ratio, keeps the gain at 1. Then each orbit's
+  // blend weight, which fades it in over blendKm from the edge of its swath.
   const n = cw * ch;
-  const orbitMedian: Record<number, Float32Array[]> = {};
-  const covered: Record<number, Uint8Array> = {};
+  const land = new Uint8Array(n);
+  for (const c of chosen) for (let i = 0; i < n; i++) if (c.scl[i] === 4 || c.scl[i] === 5) land[i] = 1;
+  const gains: Record<number, [number, number, number]> = {};
+  const weights: Record<number, Float32Array> = {};
   const buf = new Float64Array(64);
+  let acc: Float32Array[] = [];
   for (const o of orbits) {
     const mine = chosen.filter((c) => c.take.orbit === o);
+    const rgbs: Float32Array[][] = new Array(mine.length);
+    await inTurn(
+      mine.map((_, k) => k),
+      SCORE_PARALLEL,
+      async (k) => {
+        rgbs[k] = (await readTake(byTake.get(mine[k].take.datatake)!)).rgb; // the tiles in the order scored
+      },
+    );
     const med = [new Float32Array(n).fill(NaN), new Float32Array(n).fill(NaN), new Float32Array(n).fill(NaN)];
     const cov = new Uint8Array(n);
     for (let i = 0; i < n; i++) {
       for (const c of mine) if (c.scl[i]) cov[i] = 1;
       for (let band = 0; band < 3; band++) {
         let k = 0;
-        for (const c of mine) if (clear.has(c.scl[i])) buf[k++] = c.rgb[band][i];
+        for (let m = 0; m < mine.length; m++) if (clear.has(mine[m].scl[i])) buf[k++] = rgbs[m][band][i];
         if (k) med[band][i] = median(buf, k);
       }
     }
-    orbitMedian[o] = med;
-    covered[o] = cov;
-  }
-  const gains: Record<number, [number, number, number]> = {};
-  const acc = orbitMedian[orbits[0]].map((a) => Float32Array.from(a));
-  gains[orbits[0]] = [1, 1, 1];
-  // Gains are measured on land only (vegetation or bare ground on some chosen date): sea and glint differ from date to
-  // date and would skew them. Too little land shared, or an implausible ratio, keeps the gain at 1.
-  const land = new Uint8Array(n);
-  for (const c of chosen) for (let i = 0; i < n; i++) if (c.scl[i] === 4 || c.scl[i] === 5) land[i] = 1;
-  for (const o of orbits.slice(1)) {
-    const g: [number, number, number] = [1, 1, 1];
-    for (let band = 0; band < 3; band++) {
-      const ratios: number[] = [];
-      for (let i = 0; i < n; i++) {
-        if (!land[i]) continue;
-        const p = acc[band][i];
-        const q = orbitMedian[o][band][i];
-        if (p > 0.005 && q > 0.005) ratios.push(p / q);
+    if (o === orbits[0]) {
+      acc = med;
+      gains[o] = [1, 1, 1];
+    } else {
+      const g: [number, number, number] = [1, 1, 1];
+      for (let band = 0; band < 3; band++) {
+        const ratios: number[] = [];
+        for (let i = 0; i < n; i++) {
+          if (!land[i]) continue;
+          const p = acc[band][i];
+          const q = med[band][i];
+          if (p > 0.005 && q > 0.005) ratios.push(p / q);
+        }
+        ratios.sort((x, y) => x - y);
+        if (ratios.length > 200) g[band] = Math.min(1.4, Math.max(0.7, ratios[ratios.length >> 1]));
       }
-      ratios.sort((x, y) => x - y);
-      if (ratios.length > 200) g[band] = Math.min(1.4, Math.max(0.7, ratios[ratios.length >> 1]));
+      gains[o] = g;
+      for (let band = 0; band < 3; band++)
+        for (let i = 0; i < n; i++) if (Number.isNaN(acc[band][i]) && !Number.isNaN(med[band][i])) acc[band][i] = med[band][i] * g[band];
     }
-    gains[o] = g;
-    for (let band = 0; band < 3; band++)
-      for (let i = 0; i < n; i++) if (Number.isNaN(acc[band][i]) && !Number.isNaN(orbitMedian[o][band][i])) acc[band][i] = orbitMedian[o][band][i] * g[band];
-  }
-
-  // Blend weights: each orbit fades in over blendKm from the edge of its swath.
-  const weights: Record<number, Float32Array> = {};
-  for (const o of orbits) {
-    const d = distance(covered[o], cw, ch);
+    const d = distance(cov, cw, ch);
     const w = new Float32Array(n);
-    for (let i = 0; i < n; i++) w[i] = covered[o][i] ? 0.001 + smooth((d[i] * cpx) / 1000 / opts.blendKm) : 0;
+    for (let i = 0; i < n; i++) w[i] = cov[i] ? 0.001 + smooth((d[i] * cpx) / 1000 / opts.blendKm) : 0;
     weights[o] = w;
   }
 

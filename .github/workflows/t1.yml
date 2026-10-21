@@ -2,8 +2,10 @@
 # Cloudflare Pages in ONE deployment at the end (a Pages deployment must hold the whole site).
 #
 # Resumable: every job reads the live site's world/t1/manifest.json and skips shards already published, builds its own
-# share (every 20th shard) until its time budget runs out, and hands its shards to the publish job as an artifact. Run it
-# again (by hand, or let the schedule do it) until the log says nothing is left; each run publishes what it built.
+# share (every 20th shard) until its time budget runs out, and hands its shards to the publish job as artifacts: the job
+# builds in five parts, each followed by its own upload, so a runner that dies loses one part at most (run 39551888425
+# lost 14 whole jobs that way). The publish job runs even when some build jobs failed. Run it again (by hand, or let the
+# schedule do it) until the log says nothing is left; each run publishes what it built.
 # Free: standard runners in a public repository cost nothing; Cloudflare Pages' free plan has no card on file.
 name: T1 world base (80 m)
 
@@ -38,6 +40,13 @@ jobs:
       fail-fast: false
       matrix:
         slice: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    env:
+      SLICE: ${{ matrix.slice }}
+      MINUTES: ${{ github.event.inputs.minutes || '300' }}
+      LIMIT: ${{ github.event.inputs.limit }}
+      IMAGERY_OUT: out
+      IMAGERY_WORK: work
+      UV_THREADPOOL_SIZE: '8'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -45,26 +54,80 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci --no-audit --no-fund
-      - name: Build this job's share of the shards
-        env:
-          IMAGERY_OUT: out
-          IMAGERY_WORK: work
-          UV_THREADPOOL_SIZE: '8'
-        run: |
-          LIMIT="${{ github.event.inputs.limit }}"
-          npx tsx tools/imagery/world.ts run --tier t1 --all --workers 4 \
-            --slice ${{ matrix.slice }}/20 \
-            --published "$PAGES_URL/world/t1/manifest.json" \
-            --deadline-minutes "${{ github.event.inputs.minutes || '300' }}" \
-            ${LIMIT:+--limit "$LIMIT"}
-          # The per-shard build records stay here; the site gets one manifest instead.
-          find out/world/t1/shards -name '*.json' -delete 2>/dev/null || true
-          mkdir -p out/world/t1/shards
-          echo "built $(find out/world/t1/shards -name '*.bin' | wc -l) shards, $(du -sh out/world/t1/shards | cut -f1)"
-      - uses: actions/upload-artifact@v4
+      - name: Build, part 1 of 5
+        if: ${{ !cancelled() }}
+        timeout-minutes: 150
+        run: bash tools/imagery/ci/build-part.sh t1 1 5
+      - name: Upload part 1
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
         with:
-          name: t1-${{ matrix.slice }}
-          path: out/world/t1/shards
+          name: t1-${{ matrix.slice }}-1
+          path: parts/1
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Build, part 2 of 5
+        if: ${{ !cancelled() }}
+        timeout-minutes: 150
+        run: bash tools/imagery/ci/build-part.sh t1 2 5
+      - name: Upload part 2
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: t1-${{ matrix.slice }}-2
+          path: parts/2
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Build, part 3 of 5
+        if: ${{ !cancelled() }}
+        timeout-minutes: 150
+        run: bash tools/imagery/ci/build-part.sh t1 3 5
+      - name: Upload part 3
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: t1-${{ matrix.slice }}-3
+          path: parts/3
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Build, part 4 of 5
+        if: ${{ !cancelled() }}
+        timeout-minutes: 150
+        run: bash tools/imagery/ci/build-part.sh t1 4 5
+      - name: Upload part 4
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: t1-${{ matrix.slice }}-4
+          path: parts/4
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Build, part 5 of 5
+        if: ${{ !cancelled() }}
+        timeout-minutes: 150
+        run: bash tools/imagery/ci/build-part.sh t1 5 5
+      - name: Upload part 5
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: t1-${{ matrix.slice }}-5
+          path: parts/5
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Anything finished after the last upload
+        if: ${{ always() }}
+        run: bash tools/imagery/ci/build-part.sh t1 pack rest
+      - name: Upload the rest
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: t1-${{ matrix.slice }}-rest
+          path: parts/rest
           retention-days: 1
           compression-level: 0
           if-no-files-found: ignore

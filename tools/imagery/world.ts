@@ -9,6 +9,8 @@
 //   npx tsx tools/imagery/world.ts shots --at …                pictures of built shards (reports/shots/photo-map/world-dry-run/)
 //   npx tsx tools/imagery/world.ts run --tier t1 --all --slice 3/20 --published <manifest URL> --deadline-minutes 320
 //                                                             one of 20 parallel CI jobs (.github/workflows in the builder repo)
+//       --min-free-gb 3 --stop-free-gb 1.2                    the memory guard (Linux): start a shard only with 3 GB free;
+//                                                             below 1.2 GB stop the biggest worker (its shard runs again alone)
 //   npx tsx tools/imagery/world.ts site-manifest --tier t1 --dir site   the manifest of a folder about to be published
 //   npx tsx tools/imagery/world.ts t2-plan --budget-gb 10 --project-gb 5 --save    rank the places for the 10 m tier
 //   npx tsx tools/imagery/world.ts run --tier t2 --all --slice 0/20 --published <index URL>   build T2 blocks
@@ -21,8 +23,8 @@
 // can be stopped and started again, and a re-run makes the same bytes. Cost log: IMAGERY_PRICE_PER_HOUR (the machine's
 // price, dollars an hour) and IMAGERY_PUT_PRICE (dollars per 1000 writes).
 
-import { fork } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statfsSync, writeFileSync } from 'node:fs';
+import { execFileSync, fork, type ChildProcess } from 'node:child_process';
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statfsSync, writeFileSync } from 'node:fs';
 import { gunzipSync, gzipSync } from 'node:zlib';
 import { join } from 'node:path';
 import sharp from 'sharp';
@@ -30,6 +32,7 @@ import { FLAG_ALPHA, FLAG_WATER, readArchiveHead, tileKey, VERSION, writeArchive
 import { GUTTER_PX, INNER_PX, latLonToTilePixel, TILE_PX } from './cube.ts';
 import { encodeTile, SHORE_ALPHA, SHORE_MIN, SHORE_STEPS, srgbToLinear, linearToSrgb } from './finish.ts';
 import { MATCH_H, MATCH_W, worldMatch, type ShardMatch } from './match-world.ts';
+import { forgetCogs } from './cog.ts';
 import { buildBlock, buildShard, type ShardStats } from './shard.ts';
 import { planT2, type T2Block, type T2Plan } from './t2-plan.ts';
 import { storeFromEnv, type Store } from './store.ts';
@@ -63,6 +66,31 @@ const freeGB = (dir: string) => {
     return (s.bavail * s.bsize) / 1e9;
   } catch {
     return NaN;
+  }
+};
+/** Linux's memory figures (GB), or null elsewhere (the memory guard then stays off). */
+const memInfo = () => {
+  try {
+    const t = readFileSync('/proc/meminfo', 'utf8');
+    const gb = (k: string) => (Number(new RegExp(`^${k}:\\s+(\\d+) kB`, 'm').exec(t)?.[1]) * 1024) / 1e9;
+    return { availGB: gb('MemAvailable'), totalGB: gb('MemTotal'), swapUsedGB: gb('SwapTotal') - gb('SwapFree') };
+  } catch {
+    return null;
+  }
+};
+/** A process's resident memory (GB; NaN where /proc is missing). */
+const rssGB = (pid?: number) => {
+  try {
+    return (Number(/^VmRSS:\s+(\d+) kB/m.exec(readFileSync(`/proc/${pid}/status`, 'utf8'))?.[1]) * 1024) / 1e9;
+  } catch {
+    return NaN;
+  }
+};
+const diskLine = () => {
+  try {
+    return execFileSync('df', ['-h', '/'], { encoding: 'utf8' }).trim().split('\n').pop()!.replace(/\s+/g, ' ');
+  } catch {
+    return 'df unavailable';
   }
 };
 
@@ -176,10 +204,24 @@ async function run(store: Store, argv: string[]) {
     }
   }
   const deadline = arg(argv, 'deadline-minutes') ? Date.now() + Number(arg(argv, 'deadline-minutes')) * 60_000 : Infinity;
+  // Memory: a shard starts only while this much is available (Linux); below the second figure the worker using the most
+  // is stopped and its shard runs again later on its own. A runner that runs out of memory dies with every shard it has
+  // not uploaded yet (CI run 39551888425: 14 of 20 jobs, on the Greenland ice).
+  const minFreeGB = Number(arg(argv, 'min-free-gb') ?? 3);
+  const stopFreeGB = Number(arg(argv, 'stop-free-gb') ?? 1.2);
   const todo: ShardSpec[] = [];
   for (const s of mine) if (!published.has(s.id) && !(await store.exists(`${shardKey(s.id)}.json`))) todo.push(s);
-  const queue = todo.slice(0, limit);
-  log(`${mine.length} shards asked${slice ? ` (slice ${slice[0]} of ${slice[1]})` : ''}, ${published.size ? `${mine.length - todo.length} already built or published` : `${mine.length - todo.length} already built`}, ${queue.length} to build with ${workers} workers into ${store.describe}`);
+  // Shards that once ran the machine short of memory (an earlier part of this job) go last, and alone.
+  const heavy = new Set<string>();
+  for (const s of todo) if (await store.exists(`world/heavy/${s.id}.json`)) heavy.add(s.id);
+  const queue: { spec: ShardSpec; alone: boolean; tries: number }[] = todo
+    .slice(0, limit)
+    .map((spec) => ({ spec, alone: heavy.has(spec.id), tries: 0 }))
+    .sort((p, q) => Number(p.alone) - Number(q.alone));
+  log(
+    `${mine.length} shards asked${slice ? ` (slice ${slice[0]} of ${slice[1]})` : ''}, ${published.size ? `${mine.length - todo.length} already built or published` : `${mine.length - todo.length} already built`}, ${queue.length} to build with ${workers} workers into ${store.describe}` +
+      (heavy.size ? ` (${heavy.size} of them alone, last)` : ''),
+  );
   if (!queue.length) return;
   const workArgs = ['worker', '--per-orbit', arg(argv, 'per-orbit') ?? (arg(argv, 'tier') === 't1' ? '3' : arg(argv, 'tier') === 't2' ? '5' : '7'), '--quality', arg(argv, 'quality') ?? '74'];
   if (arg(argv, 'tier')) workArgs.push('--tier', arg(argv, 'tier')!);
@@ -191,26 +233,126 @@ async function run(store: Store, argv: string[]) {
   let bytes = 0;
   const total = queue.length;
   const started = Date.now();
+  type Reply = { ok: boolean; stats?: ShardStats; error?: string; died?: boolean };
+  interface Slot {
+    w: number;
+    child: ChildProcess | null;
+    reply: ((r: Reply) => void) | null;
+    spec: ShardSpec | null;
+    stopped: boolean;
+  }
+  const slots: Slot[] = Array.from({ length: Math.min(workers, queue.length) }, (_, w) => ({ w, child: null, reply: null, spec: null, stopped: false }));
+  const answer = (slot: Slot, r: Reply) => {
+    const f = slot.reply;
+    slot.reply = null;
+    f?.(r);
+  };
+  const spawn = (slot: Slot) => {
+    const child = fork(SELF, workArgs, { stdio: 'inherit', env: process.env });
+    slot.child = child;
+    slot.stopped = false;
+    child.on('message', (m: Reply) => answer(slot, m));
+    child.on('exit', (code, signal) => {
+      if (slot.child === child) slot.child = null;
+      answer(slot, { ok: false, died: true, error: slot.stopped ? 'stopped: the machine ran short of memory' : `the worker died (${signal ?? `exit code ${code}`})` });
+    });
+  };
+  const ask = (slot: Slot, spec: ShardSpec) =>
+    new Promise<Reply>((resolve) => {
+      if (!slot.child) spawn(slot);
+      slot.reply = resolve;
+      slot.spec = spec;
+      try {
+        slot.child!.send({ spec });
+      } catch (err) {
+        answer(slot, { ok: false, died: true, error: `the worker could not be reached (${String(err)})` });
+      }
+    });
+  let running = 0;
+  let aloneWaiting = false;
+  let aloneRunning = false;
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  // Waits until the shard may start (memory, and shards that must run alone), then counts it as running.
+  const turn = async (w: number, job: { spec: ShardSpec; alone: boolean }) => {
+    let said = '';
+    for (;;) {
+      if (Date.now() > deadline) return false;
+      const m = memInfo();
+      const roomy = !m || running === 0 || m.availGB >= minFreeGB;
+      const ok = job.alone ? running === 0 : !aloneRunning && !aloneWaiting;
+      if (roomy && ok) {
+        running++;
+        if (job.alone) {
+          aloneWaiting = false;
+          aloneRunning = true;
+        }
+        return true;
+      }
+      if (job.alone) aloneWaiting = true;
+      const why = !ok ? (job.alone ? `${job.spec.id} waits to run alone` : 'a shard is running alone') : `${m!.availGB.toFixed(1)} GB of memory available, ${minFreeGB} GB wanted`;
+      if (why !== said) log(`worker ${w}: waiting (${why})`);
+      said = why;
+      await sleep(5000);
+    }
+  };
+  // The guard: short of memory, stop the worker using the most. Losing one shard (it runs again alone, or is listed as
+  // failed if it was already alone) is better than losing the runner.
+  const guard = setInterval(() => {
+    const m = memInfo();
+    if (!m || m.availGB >= stopFreeGB) return;
+    const busy = slots.filter((s) => s.reply && s.child && !s.stopped);
+    const big = busy.map((s) => ({ s, rss: rssGB(s.child!.pid) })).sort((p, q) => (q.rss || 0) - (p.rss || 0))[0];
+    if (!big) return;
+    log(`memory short (${m.availGB.toFixed(1)} GB available, swap used ${m.swapUsedGB.toFixed(1)} GB): stopping worker ${big.s.w} (${big.s.spec?.id}, ${big.rss.toFixed(1)} GB); the shard runs again alone`);
+    big.s.stopped = true;
+    big.s.child!.kill('SIGKILL');
+  }, 2000);
+  const health = () => {
+    const m = memInfo();
+    log(
+      `health: disk ${diskLine()} | memory ${m ? `${m.availGB.toFixed(1)} of ${m.totalGB.toFixed(1)} GB available, swap used ${m.swapUsedGB.toFixed(1)} GB` : 'n/a'} | ` +
+        `workers ${slots
+          .map((s) => {
+            const rss = rssGB(s.child?.pid);
+            return `${s.w}: ${s.spec && s.reply ? s.spec.id : 'idle'}${Number.isFinite(rss) ? ` ${rss.toFixed(1)} GB` : ''}`;
+          })
+          .join(', ')}`,
+    );
+  };
+  health();
   await Promise.all(
-    Array.from({ length: Math.min(workers, queue.length) }, async (_, w) => {
-      const child = fork(SELF, workArgs, { stdio: 'inherit', env: process.env });
-      const ask = (spec: ShardSpec) =>
-        new Promise<{ ok: boolean; stats?: ShardStats; error?: string }>((resolve) => {
-          const onMsg = (m: { ok: boolean; stats?: ShardStats; error?: string }) => {
-            child.off('message', onMsg);
-            resolve(m);
-          };
-          child.on('message', onMsg);
-          child.send({ spec });
-        });
+    slots.map(async (slot) => {
+      const w = slot.w;
       while (queue.length) {
         if (Date.now() > deadline) {
           log(`worker ${w}: deadline reached, ${queue.length} shards left for the next run`);
           break;
         }
-        const spec = queue.shift()!;
-        let r = await ask(spec);
-        if (!r.ok) r = await ask(spec); // one retry (network trouble)
+        const job = queue.shift()!;
+        if (!(await turn(w, job))) {
+          queue.unshift(job);
+          continue;
+        }
+        const { spec } = job;
+        let r: Reply;
+        try {
+          r = await ask(slot, spec);
+          if (!r.ok && !r.died) r = await ask(slot, spec); // one retry (network trouble)
+        } finally {
+          running--;
+          if (job.alone) aloneRunning = false;
+        }
+        // A worker that was killed left its work files behind.
+        if (r.died) rmSync(join(process.env.IMAGERY_WORK ?? join(CACHE, 'world-work'), spec.id), { recursive: true, force: true });
+        if (!r.ok && r.died && !job.alone && job.tries < 1) {
+          // Killed for memory (or crashed): once more, alone, after the rest; later parts of the job remember it.
+          job.tries++;
+          job.alone = true;
+          queue.push(job);
+          await store.put(`world/heavy/${spec.id}.json`, new TextEncoder().encode(JSON.stringify({ id: spec.id, error: r.error })), 'application/json');
+          log(`[${done + failed}/${total}] ${spec.id} ${r.error}: queued again to run alone | worker ${w}`);
+          continue;
+        }
         if (r.ok && r.stats) {
           done++;
           readMB += r.stats.downloadMB;
@@ -224,15 +366,20 @@ async function run(store: Store, argv: string[]) {
         const rate = done / Math.max(hours, 1e-6);
         const left = total - done - failed;
         const cost = hours * price + ((store.stats.puts + done * 2) / 1000) * putPrice;
+        const m = memInfo();
         log(
           `[${done + failed}/${total}] ${spec.id} ${r.ok ? `done (${((r.stats?.bytes ?? 0) / 1e6).toFixed(1)} MB, ${r.stats?.seconds} s)` : `FAILED: ${r.error}`} | ` +
             `${rate.toFixed(2)} shards/h, ETA ${(left / Math.max(rate, 1e-6)).toFixed(1)} h | read ${(readMB / 1000).toFixed(2)} GB, wrote ${(bytes / 1e9).toFixed(3)} GB, CPU ${(cpuS / 3600).toFixed(2)} h | ` +
-            `cost so far $${cost.toFixed(2)}${price ? '' : ' (set IMAGERY_PRICE_PER_HOUR)'} | worker ${w}, free disk ${freeGB(process.env.IMAGERY_WORK ?? CACHE).toFixed(1)} GB`,
+            `cost so far $${cost.toFixed(2)}${price ? '' : ' (set IMAGERY_PRICE_PER_HOUR)'} | worker ${w}, free disk ${freeGB(process.env.IMAGERY_WORK ?? CACHE).toFixed(1)} GB` +
+            (m ? `, memory ${m.availGB.toFixed(1)} GB available` : ''),
         );
+        if ((done + failed) % 25 === 0) health();
       }
-      child.kill();
+      slot.child?.kill();
     }),
   );
+  clearInterval(guard);
+  health();
   log(`run over: ${done} built, ${failed} failed (listed in world/failed/)`);
 }
 
@@ -259,6 +406,10 @@ function worker(store: Store, argv: string[]) {
       process.send!({ ok: true, stats });
     } catch (err) {
       process.send!({ ok: false, error: err instanceof Error ? `${err.message}` : String(err) });
+    } finally {
+      // Nothing of a shard outlives it: its work files (also after a failure) and the COG headers it read.
+      rmSync(join(work, m.spec.id), { recursive: true, force: true });
+      forgetCogs();
     }
   });
 }

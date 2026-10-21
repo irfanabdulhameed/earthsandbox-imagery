@@ -3,10 +3,11 @@
 # files: <project>-t2a, <project>-t2b, … created on demand), with one index on the main project (world/t2/index.json, its
 # `bases` naming each project) that the game reads.
 #
-# A run: 20 jobs build every 20th block not yet in the live index until their time budget runs out; then one job per
-# project gathers that project's new blocks, fetches the blocks the project already serves, and deploys it whole (a Pages
-# deployment replaces the site); last, one job rebuilds the index from every project's own list and deploys the main
-# project (with everything it already serves). Run it again until the build jobs find nothing left.
+# A run: 20 jobs build every 20th block not yet in the live index until their time budget runs out (in five parts, each
+# uploaded as it ends, so a runner that dies loses one part at most); then one job per project gathers that project's new
+# blocks, fetches the blocks the project already serves, and deploys it whole (a Pages deployment replaces the site);
+# last, one job rebuilds the index from every project's own list and deploys the main project (with everything it
+# already serves). Run it again until the build jobs find nothing left.
 #
 # Runners: GitHub runs 20 jobs at once for the whole account, so beside a T1 run the two share them (jobs past 20 wait their
 # turn; each build job's time budget starts when it starts). Best started after T1 is done. Deployments of the main project
@@ -56,6 +57,13 @@ jobs:
       fail-fast: false
       matrix:
         slice: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    env:
+      SLICE: ${{ matrix.slice }}
+      MINUTES: ${{ github.event.inputs.minutes || '300' }}
+      LIMIT: ${{ github.event.inputs.limit }}
+      IMAGERY_OUT: out
+      IMAGERY_WORK: work
+      UV_THREADPOOL_SIZE: '8'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -63,25 +71,80 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci --no-audit --no-fund
-      - name: Build this job's share of the blocks
-        env:
-          IMAGERY_OUT: out
-          IMAGERY_WORK: work
-          UV_THREADPOOL_SIZE: '8'
-        run: |
-          LIMIT="${{ github.event.inputs.limit }}"
-          npx tsx tools/imagery/world.ts run --tier t2 --all --workers 4 \
-            --slice ${{ matrix.slice }}/20 \
-            --published "$PAGES_URL/world/t2/index.json" \
-            --deadline-minutes "${{ github.event.inputs.minutes || '300' }}" \
-            ${LIMIT:+--limit "$LIMIT"}
-          find out/world/t2 -name '*.json' -delete 2>/dev/null || true
-          mkdir -p out/world/t2
-          echo "built $(find out/world/t2 -name '*.bin' | wc -l) blocks, $(du -sh out/world/t2 | cut -f1)"
-      - uses: actions/upload-artifact@v4
+      - name: Build, part 1 of 5
+        if: ${{ !cancelled() }}
+        timeout-minutes: 150
+        run: bash tools/imagery/ci/build-part.sh t2 1 5
+      - name: Upload part 1
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
         with:
-          name: t2-${{ matrix.slice }}
-          path: out/world/t2
+          name: t2-${{ matrix.slice }}-1
+          path: parts/1
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Build, part 2 of 5
+        if: ${{ !cancelled() }}
+        timeout-minutes: 150
+        run: bash tools/imagery/ci/build-part.sh t2 2 5
+      - name: Upload part 2
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: t2-${{ matrix.slice }}-2
+          path: parts/2
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Build, part 3 of 5
+        if: ${{ !cancelled() }}
+        timeout-minutes: 150
+        run: bash tools/imagery/ci/build-part.sh t2 3 5
+      - name: Upload part 3
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: t2-${{ matrix.slice }}-3
+          path: parts/3
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Build, part 4 of 5
+        if: ${{ !cancelled() }}
+        timeout-minutes: 150
+        run: bash tools/imagery/ci/build-part.sh t2 4 5
+      - name: Upload part 4
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: t2-${{ matrix.slice }}-4
+          path: parts/4
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Build, part 5 of 5
+        if: ${{ !cancelled() }}
+        timeout-minutes: 150
+        run: bash tools/imagery/ci/build-part.sh t2 5 5
+      - name: Upload part 5
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: t2-${{ matrix.slice }}-5
+          path: parts/5
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: Anything finished after the last upload
+        if: ${{ always() }}
+        run: bash tools/imagery/ci/build-part.sh t2 pack rest
+      - name: Upload the rest
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: t2-${{ matrix.slice }}-rest
+          path: parts/rest
           retention-days: 1
           compression-level: 0
           if-no-files-found: ignore

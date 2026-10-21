@@ -10,7 +10,7 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { deflateSync, inflateSync } from 'node:zlib';
-import { openCog, readWindow, type Cog } from './cog.ts';
+import { cachedCog, readWindow, type Cog } from './cog.ts';
 import { resOf, type Composite, type Grid, type Plan } from './composite.ts';
 
 /** The overview level of a COG whose pixel is `factor` times the full-resolution one. */
@@ -37,12 +37,7 @@ export interface WaterGrid {
   waterShare: number;
 }
 
-const cogs = new Map<string, Promise<Cog>>();
-const cog = (url: string) => {
-  let c = cogs.get(url);
-  if (!c) cogs.set(url, (c = openCog(url)));
-  return c;
-};
+const cog = cachedCog;
 
 /** The water grid over a composite's grid: pixels twice the composite's (20 m over 10 m, like the classification's own). */
 export function waterGridOf(grid: Grid) {

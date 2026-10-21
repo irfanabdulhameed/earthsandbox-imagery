@@ -16,7 +16,10 @@ account or key is needed for the data.
 
 - `.github/workflows/t1.yml`: 20 parallel jobs, each building every 20th shard until its time budget runs out, then one
   job publishes everything in a single Pages deployment. Run it again until nothing is left (it skips what the live
-  site already lists; a schedule repeats it every 6 hours).
+  site already lists; a schedule repeats it every 6 hours). Each job builds in five parts and uploads after each
+  (`tools/imagery/ci/build-part.sh`), so a runner that dies loses one part at most, and the publish job runs even when
+  some jobs failed. The runner starts a shard only while 3 GB of memory is free, stops the worker using the most below
+  1.2 GB (that shard runs again alone, last), and logs disk and memory every 25 shards.
 - `.github/workflows/t0.yml`: builds T0 in one job and publishes it with the rest of the site.
 - `.github/workflows/t2.yml`: the 10 m tier for the places in `tools/imagery/t2-plan.json.gz` (13,333 level-9 tiles of the
   biggest cities and the populated coasts, 6,931 block archives, about 10 GB) over two more Pages projects
