@@ -105,10 +105,16 @@ async function main() {
     let have = 0;
     let total = Infinity;
     for (let attempt = 0; have < total; attempt++) {
-      if (attempt > 20) throw new Error(`Blue Marble ${panel}: gave up after ${attempt} tries`);
+      // (NASA's server cuts long downloads and sometimes refuses for minutes: be patient, with a growing pause.)
+      if (attempt > 200) throw new Error(`Blue Marble ${panel}: gave up after ${attempt} tries`);
       try {
-        const res = await fetch(url, { headers: have ? { Range: `bytes=${have}-` } : {} });
+        const res = await fetch(url, { headers: have ? { Range: `bytes=${have}-` } : {}, signal: AbortSignal.timeout(180_000) });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        // A server that ignores the Range header sends the whole file again: start over rather than append it.
+        if (have && res.status === 200) {
+          parts.length = 0;
+          have = 0;
+        }
         const len = Number(res.headers.get('content-length') ?? NaN);
         if (!have) total = len;
         const reader = res.body!.getReader();
@@ -118,8 +124,10 @@ async function main() {
           parts.push(value);
           have += value.length;
         }
-      } catch {
-        await new Promise((r) => setTimeout(r, 2000));
+      } catch (e) {
+        const wait = Math.min(60_000, 2000 * 1.5 ** Math.min(attempt, 12));
+        log(`Blue Marble ${panel}: ${(e as Error).message ?? e}; ${Math.round(have / 1048576)} of ${Math.round(total / 1048576)} MB, retry ${attempt + 1} in ${Math.round(wait / 1000)} s`);
+        await new Promise((r) => setTimeout(r, wait));
       }
     }
     writeFileSync(file, Buffer.concat(parts));
